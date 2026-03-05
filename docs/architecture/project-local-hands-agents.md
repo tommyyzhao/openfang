@@ -50,14 +50,14 @@ for h in json.load(sys.stdin)['hands']:
     src = '[project]' if h.get('source') == 'project' else '[bundled]'
     print(f\"  {src} {h['id']}: {h['name']}\")
 "
-#   [project] project:deploy: Deploy Hand
-#   [project] project:monitor: Monitor Hand
+#   [project] project:backend-api:deploy: Deploy Hand
+#   [project] project:backend-api:monitor: Monitor Hand
 #   [bundled] browser: Browser Hand
 #   [bundled] clip: Clipboard Hand
 #   ... 5 more bundled hands
 
 # 5. Activate a project hand (same UX as bundled hands)
-curl -s -X POST http://127.0.0.1:4200/api/hands/project:deploy/activate \
+curl -s -X POST http://127.0.0.1:4200/api/hands/project:backend-api:deploy/activate \
   -H "Content-Type: application/json" \
   -d '{"config": {"target_env": "staging"}}'
 
@@ -192,8 +192,8 @@ is the only reliable mechanism.
 ```rust
 /// Load hand definitions from a project directory's .openfang/hands/ folder.
 /// Returns the number of hands successfully loaded.
-/// Project-local hands are namespaced with "project:" prefix to avoid
-/// collisions with bundled hands.
+/// Project-local hands are namespaced with "project:{dir}:" prefix to avoid
+/// collisions with bundled hands and between multiple projects.
 pub fn load_from_directory(&mut self, project_dir: &Path) -> usize {
     let hands_dir = project_dir.join(".openfang").join("hands");
     // For each subdirectory in hands_dir:
@@ -201,18 +201,24 @@ pub fn load_from_directory(&mut self, project_dir: &Path) -> usize {
     //   2. Read SKILL.md (optional)
     //   3. Parse HandDefinition via toml::from_str()
     //   4. Manually attach skill_content (because it's #[serde(skip)])
-    //   5. Validate: reject if tools contains "shell_exec" (security)
-    //   6. Namespace the id: "project:{original_id}"
-    //   7. Insert into definitions HashMap
-    //   8. If a bundled hand has the same base id, log a warning
+    //   5. Validate: reject if tools contains "shell_exec" or "web_fetch" (security)
+    //   6. Force mcp_servers = [], api_key_env = None (security)
+    //   7. Apply restricted tool allowlist (strip unlisted tools)
+    //   8. Validate hand ID does not contain ":" (reserved separator)
+    //   9. Namespace the id: "project:{project_dir_name}:{original_id}"
+    //  10. Insert into definitions HashMap
+    //  11. If a bundled hand has the same base id, log a warning
 }
 ```
 
 **Key design decisions**:
 
-- **Namespacing**: Project hands get `id = "project:{original_id}"`. This prevents
-  silent overwriting of bundled hands. The original `id` field in HAND.toml is the
-  base name (e.g., `id = "deploy"`), stored as `project:deploy` in the registry.
+- **Namespacing**: Project hands get `id = "project:{project-dir-name}:{original_id}"`.
+  This prevents silent overwriting of bundled hands AND collisions between multiple
+  projects. The original `id` field in HAND.toml is the base name (e.g., `id = "deploy"`),
+  and the project dir name is the last component of the project path (e.g., `backend-api`),
+  resulting in `project:backend-api:deploy` in the registry. The `:` character is
+  reserved as a namespace separator — hand IDs in HAND.toml must not contain `:`.
 
 - **`skill_content` handling**: Mirrors `parse_bundled()` -- read SKILL.md separately,
   attach to the parsed struct after deserialization. If SKILL.md is missing, that's
@@ -220,9 +226,10 @@ pub fn load_from_directory(&mut self, project_dir: &Path) -> usize {
 
 - **Security restrictions for v1**:
   - Project-local hands CANNOT grant themselves `shell_exec` (stripped with warning log)
-  - Project-local hands CANNOT specify `api_key_env` (uses kernel default only)
+  - Project-local hands CANNOT use `web_fetch` (blocked — `file_read` + `web_fetch` = full data exfiltration)
+  - Project-local hands CANNOT specify `api_key_env` (force-nullified after parsing, uses kernel default only)
   - Project-local hands are NEVER auto-activated (appear in marketplace only)
-  - MCP server references are allowed but logged prominently
+  - MCP servers are **blocked entirely** for project-local hands in v1 (force `mcp_servers = []` after parsing, log warning)
 
 - **Filesystem**: `openfang-hands` currently uses zero `std::fs`. This adds it, but
   only in the new `load_from_directory()` method. The rest of the crate remains
@@ -298,7 +305,7 @@ add a `source` field to both `HandDefinition` and `AgentEntry`:
 
 ```rust
 // In HandDefinition (openfang-hands/src/lib.rs)
-#[serde(default)]
+#[serde(skip)]
 pub source: HandSource,
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -328,26 +335,50 @@ picker). It lays the groundwork for future reconciliation without adding complex
 1. **`shell_exec` stripped**: Project-local hands cannot grant themselves shell access.
    If HAND.toml lists `shell_exec` in tools, it's silently removed and a warning is logged.
    ```
-   WARN: Project hand "project:deploy" requested shell_exec -- stripped for security.
+   WARN: Project hand "project:backend-api:deploy" requested shell_exec -- stripped for security.
          To grant shell access, activate via API with explicit override.
    ```
 
-2. **`api_key_env` ignored**: Project-local hands cannot specify which API key env var
-   to read. They always use the kernel's default model config. This prevents a hand
-   from tricking the system into reading arbitrary env vars.
+2. **`web_fetch` blocked**: Project-local hands cannot use `web_fetch`. The combination
+   of `file_read` + `web_fetch` enables full data exfiltration (read secrets, send to
+   attacker). A malicious `system_prompt` could weaponize this even without `shell_exec`.
+   ```
+   WARN: Project hand "project:backend-api:deploy" requested web_fetch -- stripped for security.
+         Project-local hands cannot access the network in v1.
+   ```
 
-3. **Never auto-activated**: Project hands appear in the marketplace but require
+3. **`api_key_env` force-nullified**: After parsing a project HAND.toml, `api_key_env`
+   is explicitly set to `None` (not just "ignored" — actively cleared). This prevents a
+   hand from tricking the system into reading arbitrary env vars.
+
+4. **Never auto-activated**: Project hands appear in the marketplace but require
    explicit user action to activate. This is the consent mechanism.
 
-4. **MCP servers logged**: If a project hand references MCP servers, a prominent
-   notice is logged at startup:
+5. **MCP servers blocked entirely**: In v1, project-local hands CANNOT reference MCP
+   servers. After parsing, `mcp_servers` is forced to `[]`. MCP servers can execute
+   arbitrary code on the host — "logging" is not a sufficient security control.
    ```
-   NOTICE: Project hand "project:deploy" references MCP servers: ["custom-server"].
-           These will connect to external services when the hand is activated.
+   WARN: Project hand "project:backend-api:deploy" references MCP servers: ["custom-server"].
+         MCP servers are blocked for project-local hands in v1. Stripped.
    ```
 
-5. **Path traversal prevention**: Hand/agent directory scanning rejects symlinks that
+6. **Restricted tool allowlist**: Project-local hands may only use tools from the
+   following allowlist: `file_read`, `file_write`, `code_search`, `code_edit`,
+   `clipboard`, `browser` (read-only). Any tool not on the allowlist is stripped
+   with a warning. This is the defense-in-depth layer — even if a new dangerous
+   tool is added to the system in the future, project hands won't get access
+   automatically.
+
+7. **Path traversal prevention**: Hand/agent directory scanning rejects symlinks that
    escape the `.openfang/` directory and paths containing `..`.
+
+8. **CWD auto-detection warning**: If `.openfang/` exists in the current working
+   directory but is not in the loaded project set, log a prominent notice:
+   ```
+   NOTICE: Found .openfang/ in CWD (/home/user/backend-api) but it is not registered.
+           Use `openfang start --project .` to load project-local definitions.
+   ```
+   This prevents the silent failure mode where a developer forgets `--project`.
 
 **Future enhancement** (not in v1): A workspace trust prompt similar to VS Code:
 "This project wants to register 2 hands and 1 agent template. Allow? [y/N]"
@@ -364,24 +395,26 @@ with a hash-based allowlist in `~/.openfang/trusted_projects.toml`.
 3. Add `--project` flag to `StartArgs` in openfang-cli (just the arg definition)
 4. In kernel `boot_with_config()`, resolve project directories (CLI > config > CWD)
 5. Validate each: exists, contains `.openfang/`, is readable
+6. If CWD has `.openfang/` but is not in the resolved set, log a prominent NOTICE
 
 ### Phase 2: Hand Loading (openfang-hands)
 
-6. Add `HandSource` enum to `lib.rs`
-7. Add `source: HandSource` field to `HandDefinition` with `#[serde(default)]`
-8. Implement `HandRegistry::load_from_directory(project_dir: &Path) -> usize`
+7. Add `HandSource` enum to `lib.rs`
+8. Add `source: HandSource` field to `HandDefinition` with `#[serde(skip)]`
+9. Implement `HandRegistry::load_from_directory(project_dir: &Path) -> usize`
    - Walk `.openfang/hands/*/HAND.toml`
    - Parse TOML, attach SKILL.md (mirror `parse_bundled()` pattern)
-   - Namespace id with `project:` prefix
-   - Strip `shell_exec`, ignore `api_key_env`, log MCP servers
+   - Namespace id with `project:{dir}:` prefix
+   - Strip `shell_exec` + `web_fetch`, force-nullify `api_key_env`, block MCP servers
+   - Apply restricted tool allowlist, validate hand ID has no `:`
    - Insert into definitions HashMap
-9. Call `load_from_directory()` in kernel boot, after `load_bundled()`
+10. Call `load_from_directory()` in kernel boot, after `load_bundled()`
 
 ### Phase 3: Agent Templates (openfang-kernel)
 
-10. In template discovery, add project `.openfang/agents/` directories as a source
-11. Tag project templates with `source:project` metadata
-12. In `spawn_agent()`, if template has a project source directory:
+11. In template discovery, add project `.openfang/agents/` directories as a source
+12. Tag project templates with `source:project` metadata
+13. In `spawn_agent()`, if template has a project source directory:
     - Copy SOUL.md from project template to workspace (if exists)
     - Copy TOOLS.md from project template to workspace (if exists)
     - Copy skills/ from project template to workspace (if exists)
@@ -389,26 +422,29 @@ with a hash-based allowlist in `~/.openfang/trusted_projects.toml`.
 
 ### Phase 4: .gitignore Generation
 
-13. When loading from a project directory, check for `.openfang/.gitignore`
-14. If missing, log a warning:
+14. When loading from a project directory, check for `.openfang/.gitignore`
+15. If missing, log a warning:
     ```
     WARN: Project .openfang/ has no .gitignore. Runtime state may leak into git.
           Run `openfang init --project` to generate one, or create it manually.
     ```
-15. Add `openfang init --project` subcommand that creates `.openfang/.gitignore`
-    with the standard patterns (workspaces/, *.db, .env, etc.)
+16. Add `openfang init --project` subcommand that creates `.openfang/.gitignore`
+    with the standard patterns, plus scaffolds `hands/` and `agents/` dirs with
+    example files
 
 ### Phase 5: API & Display
 
-16. Add `source` field to hand list API response (for UI "[project]" tags)
-17. Add `source` field to template list (for CLI `[project]` display)
+17. Add `source` field to hand list API response (for UI "[project]" tags)
+18. Add `source` field to template list (for CLI `[project]` display)
 
 ### Phase 6: Tests
 
-18. Unit tests: TOML parsing for project-local hands (string input, no filesystem)
-19. Unit tests: namespace collision handling, security stripping
-20. Integration tests: tempdir with `.openfang/hands/` structure → boot kernel → verify hands appear
-21. Integration tests: tempdir with `.openfang/agents/` → spawn agent → verify seed files copied
+19. Unit tests: TOML parsing for project-local hands (string input, no filesystem)
+20. Unit tests: namespace collision handling, security stripping, tool allowlist
+21. Unit tests: hand ID validation (reject `:` in HAND.toml id field)
+22. Integration tests: tempdir with `.openfang/hands/` structure → boot kernel → verify hands appear
+23. Integration tests: tempdir with `.openfang/agents/` → spawn agent → verify seed files copied
+24. Integration tests: multi-project namespace isolation (two projects with same hand id)
 
 ---
 
