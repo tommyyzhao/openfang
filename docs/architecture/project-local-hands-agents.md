@@ -201,13 +201,12 @@ pub fn load_from_directory(&mut self, project_dir: &Path) -> usize {
     //   2. Read SKILL.md (optional)
     //   3. Parse HandDefinition via toml::from_str()
     //   4. Manually attach skill_content (because it's #[serde(skip)])
-    //   5. Validate: reject if tools contains "shell_exec" or "web_fetch" (security)
+    //   5. Validate: strip "shell_exec" from tools if present (security)
     //   6. Force mcp_servers = [], api_key_env = None (security)
-    //   7. Apply restricted tool allowlist (strip unlisted tools)
-    //   8. Validate hand ID does not contain ":" (reserved separator)
-    //   9. Namespace the id: "project:{project_dir_name}:{original_id}"
-    //  10. Insert into definitions HashMap
-    //  11. If a bundled hand has the same base id, log a warning
+    //   7. Validate hand ID does not contain ":" (reserved separator)
+    //   8. Namespace the id: "project:{project_dir_name}:{original_id}"
+    //   9. Insert into definitions HashMap
+    //  10. If a bundled hand has the same base id, log a warning
 }
 ```
 
@@ -226,10 +225,13 @@ pub fn load_from_directory(&mut self, project_dir: &Path) -> usize {
 
 - **Security restrictions for v1**:
   - Project-local hands CANNOT grant themselves `shell_exec` (stripped with warning log)
-  - Project-local hands CANNOT use `web_fetch` (blocked — `file_read` + `web_fetch` = full data exfiltration)
   - Project-local hands CANNOT specify `api_key_env` (force-nullified after parsing, uses kernel default only)
-  - Project-local hands are NEVER auto-activated (appear in marketplace only)
+  - Project-local hands are NEVER auto-activated (appear in marketplace only; explicit activation = user consent)
   - MCP servers are **blocked entirely** for project-local hands in v1 (force `mcp_servers = []` after parsing, log warning)
+  - `web_fetch` is **allowed** — since hands require explicit manual activation, the user's
+    trust in activating a hand is the security boundary. Blocking `web_fetch` would cripple
+    legitimate use cases (research hands, API hands, monitor hands). The existing SSRF
+    protection (see `docs/security.md` §7) applies to all `web_fetch` calls regardless of source.
 
 - **Filesystem**: `openfang-hands` currently uses zero `std::fs`. This adds it, but
   only in the new `load_from_directory()` method. The rest of the crate remains
@@ -308,7 +310,7 @@ add a `source` field to both `HandDefinition` and `AgentEntry`:
 #[serde(skip)]
 pub source: HandSource,
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Default)]
 pub enum HandSource {
     #[default]
     Bundled,
@@ -332,53 +334,54 @@ picker). It lays the groundwork for future reconciliation without adding complex
 
 **v1 mitigations** (pragmatic, no trust prompt yet):
 
-1. **`shell_exec` stripped**: Project-local hands cannot grant themselves shell access.
+1. **Never auto-activated (primary security boundary)**: Project hands appear in the
+   marketplace but require explicit user action to activate. The developer must review
+   the hand definition and consciously choose to activate it. This explicit consent is
+   the primary security mechanism — the same trust model as installing any npm package
+   or pip dependency from a repo.
+
+2. **`shell_exec` stripped**: Project-local hands cannot grant themselves shell access.
    If HAND.toml lists `shell_exec` in tools, it's silently removed and a warning is logged.
    ```
    WARN: Project hand "project:backend-api:deploy" requested shell_exec -- stripped for security.
          To grant shell access, activate via API with explicit override.
    ```
 
-2. **`web_fetch` blocked**: Project-local hands cannot use `web_fetch`. The combination
-   of `file_read` + `web_fetch` enables full data exfiltration (read secrets, send to
-   attacker). A malicious `system_prompt` could weaponize this even without `shell_exec`.
-   ```
-   WARN: Project hand "project:backend-api:deploy" requested web_fetch -- stripped for security.
-         Project-local hands cannot access the network in v1.
-   ```
-
 3. **`api_key_env` force-nullified**: After parsing a project HAND.toml, `api_key_env`
    is explicitly set to `None` (not just "ignored" — actively cleared). This prevents a
    hand from tricking the system into reading arbitrary env vars.
 
-4. **Never auto-activated**: Project hands appear in the marketplace but require
-   explicit user action to activate. This is the consent mechanism.
-
-5. **MCP servers blocked entirely**: In v1, project-local hands CANNOT reference MCP
+4. **MCP servers blocked entirely**: In v1, project-local hands CANNOT reference MCP
    servers. After parsing, `mcp_servers` is forced to `[]`. MCP servers can execute
-   arbitrary code on the host — "logging" is not a sufficient security control.
+   arbitrary code on the host — they bypass the capability model entirely.
    ```
    WARN: Project hand "project:backend-api:deploy" references MCP servers: ["custom-server"].
          MCP servers are blocked for project-local hands in v1. Stripped.
    ```
 
-6. **Restricted tool allowlist**: Project-local hands may only use tools from the
-   following allowlist: `file_read`, `file_write`, `code_search`, `code_edit`,
-   `clipboard`, `browser` (read-only). Any tool not on the allowlist is stripped
-   with a warning. This is the defense-in-depth layer — even if a new dangerous
-   tool is added to the system in the future, project hands won't get access
-   automatically.
+5. **`web_fetch` allowed**: Since activation requires explicit user consent, `web_fetch`
+   is permitted for project-local hands. The existing SSRF protection system (private IP
+   blocking, DNS rebinding guard — see `docs/security.md` §7) applies to all `web_fetch`
+   calls regardless of hand source. Blocking `web_fetch` would cripple legitimate use
+   cases like research hands, API integration hands, and monitoring hands.
 
-7. **Path traversal prevention**: Hand/agent directory scanning rejects symlinks that
+6. **Path traversal prevention**: Hand/agent directory scanning rejects symlinks that
    escape the `.openfang/` directory and paths containing `..`.
 
-8. **CWD auto-detection warning**: If `.openfang/` exists in the current working
+7. **CWD auto-detection warning**: If `.openfang/` exists in the current working
    directory but is not in the loaded project set, log a prominent notice:
    ```
    NOTICE: Found .openfang/ in CWD (/home/user/backend-api) but it is not registered.
            Use `openfang start --project .` to load project-local definitions.
    ```
    This prevents the silent failure mode where a developer forgets `--project`.
+
+**Audit logging**: When a project-local hand uses `web_fetch`, log the URL at INFO
+level for auditability:
+```
+INFO: Project hand "project:backend-api:deploy" used web_fetch → https://api.example.com/deploy
+```
+This gives operators visibility without blocking legitimate use.
 
 **Future enhancement** (not in v1): A workspace trust prompt similar to VS Code:
 "This project wants to register 2 hands and 1 agent template. Allow? [y/N]"
@@ -405,8 +408,8 @@ with a hash-based allowlist in `~/.openfang/trusted_projects.toml`.
    - Walk `.openfang/hands/*/HAND.toml`
    - Parse TOML, attach SKILL.md (mirror `parse_bundled()` pattern)
    - Namespace id with `project:{dir}:` prefix
-   - Strip `shell_exec` + `web_fetch`, force-nullify `api_key_env`, block MCP servers
-   - Apply restricted tool allowlist, validate hand ID has no `:`
+   - Strip `shell_exec`, force-nullify `api_key_env`, block MCP servers
+   - Validate hand ID has no `:`
    - Insert into definitions HashMap
 10. Call `load_from_directory()` in kernel boot, after `load_bundled()`
 
@@ -440,7 +443,7 @@ with a hash-based allowlist in `~/.openfang/trusted_projects.toml`.
 ### Phase 6: Tests
 
 19. Unit tests: TOML parsing for project-local hands (string input, no filesystem)
-20. Unit tests: namespace collision handling, security stripping, tool allowlist
+20. Unit tests: namespace collision handling, security stripping (shell_exec, MCP, api_key_env)
 21. Unit tests: hand ID validation (reject `:` in HAND.toml id field)
 22. Integration tests: tempdir with `.openfang/hands/` structure → boot kernel → verify hands appear
 23. Integration tests: tempdir with `.openfang/agents/` → spawn agent → verify seed files copied
@@ -474,3 +477,11 @@ with a hash-based allowlist in `~/.openfang/trusted_projects.toml`.
 | `crates/openfang-api/src/routes.rs` | Add `source` to hand list response |
 
 No new crates. No new dependencies (std::fs is sufficient for directory walking).
+
+## Documentation Updates Required
+
+| Document | Update Needed |
+|----------|--------------|
+| `docs/agent-templates.md` | Document SOUL.md, TOOLS.md, and per-agent `skills/` directory convention for project-local agent templates |
+| `docs/configuration.md` | Add `project_dirs` field to the config reference |
+| `docs/architecture.md` | Add a section on project-local discovery in the system architecture overview |
