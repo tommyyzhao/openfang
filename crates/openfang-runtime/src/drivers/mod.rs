@@ -5,6 +5,7 @@
 //! Mistral, Fireworks, Ollama, vLLM, and any OpenAI-compatible endpoint.
 
 pub mod anthropic;
+pub mod claude_code;
 pub mod copilot;
 pub mod fallback;
 pub mod gemini;
@@ -16,8 +17,9 @@ use openfang_types::model_catalog::{
     FIREWORKS_BASE_URL, GEMINI_BASE_URL, GROQ_BASE_URL, HUGGINGFACE_BASE_URL, LMSTUDIO_BASE_URL,
     MINIMAX_BASE_URL, MISTRAL_BASE_URL, MOONSHOT_BASE_URL, OLLAMA_BASE_URL, OPENAI_BASE_URL,
     OPENROUTER_BASE_URL, PERPLEXITY_BASE_URL, QIANFAN_BASE_URL, QWEN_BASE_URL,
-    REPLICATE_BASE_URL, SAMBANOVA_BASE_URL, TOGETHER_BASE_URL, VLLM_BASE_URL, XAI_BASE_URL,
-    ZHIPU_BASE_URL,
+    REPLICATE_BASE_URL, SAMBANOVA_BASE_URL, TOGETHER_BASE_URL, VLLM_BASE_URL,
+    VOLCENGINE_BASE_URL, VOLCENGINE_CODING_BASE_URL, XAI_BASE_URL, ZAI_BASE_URL,
+    ZAI_CODING_BASE_URL, ZHIPU_BASE_URL, ZHIPU_CODING_BASE_URL,
 };
 use std::sync::Arc;
 
@@ -132,6 +134,16 @@ fn provider_defaults(provider: &str) -> Option<ProviderDefaults> {
             api_key_env: "GITHUB_TOKEN",
             key_required: true,
         }),
+        "codex" | "openai-codex" => Some(ProviderDefaults {
+            base_url: OPENAI_BASE_URL,
+            api_key_env: "OPENAI_API_KEY",
+            key_required: true,
+        }),
+        "claude-code" => Some(ProviderDefaults {
+            base_url: "",
+            api_key_env: "",
+            key_required: false,
+        }),
         "moonshot" | "kimi" => Some(ProviderDefaults {
             base_url: MOONSHOT_BASE_URL,
             api_key_env: "MOONSHOT_API_KEY",
@@ -152,9 +164,34 @@ fn provider_defaults(provider: &str) -> Option<ProviderDefaults> {
             api_key_env: "ZHIPU_API_KEY",
             key_required: true,
         }),
+        "zhipu_coding" | "codegeex" => Some(ProviderDefaults {
+            base_url: ZHIPU_CODING_BASE_URL,
+            api_key_env: "ZHIPU_API_KEY",
+            key_required: true,
+        }),
+        "zai" => Some(ProviderDefaults {
+            base_url: ZAI_BASE_URL,
+            api_key_env: "ZHIPU_API_KEY",
+            key_required: true,
+        }),
+        "zai_coding" => Some(ProviderDefaults {
+            base_url: ZAI_CODING_BASE_URL,
+            api_key_env: "ZHIPU_API_KEY",
+            key_required: true,
+        }),
         "qianfan" | "baidu" => Some(ProviderDefaults {
             base_url: QIANFAN_BASE_URL,
             api_key_env: "QIANFAN_API_KEY",
+            key_required: true,
+        }),
+        "volcengine" | "doubao" => Some(ProviderDefaults {
+            base_url: VOLCENGINE_BASE_URL,
+            api_key_env: "VOLCENGINE_API_KEY",
+            key_required: true,
+        }),
+        "volcengine_coding" => Some(ProviderDefaults {
+            base_url: VOLCENGINE_CODING_BASE_URL,
+            api_key_env: "VOLCENGINE_API_KEY",
             key_required: true,
         }),
         _ => None,
@@ -222,6 +259,31 @@ pub fn create_driver(config: &DriverConfig) -> Result<Arc<dyn LlmDriver>, LlmErr
         return Ok(Arc::new(gemini::GeminiDriver::new(api_key, base_url)));
     }
 
+    // Codex — reuses OpenAI driver with credential sync from Codex CLI
+    if provider == "codex" || provider == "openai-codex" {
+        let api_key = config
+            .api_key
+            .clone()
+            .or_else(|| std::env::var("OPENAI_API_KEY").ok())
+            .or_else(crate::model_catalog::read_codex_credential)
+            .ok_or_else(|| {
+                LlmError::MissingApiKey(
+                    "Set OPENAI_API_KEY or install Codex CLI".to_string(),
+                )
+            })?;
+        let base_url = config
+            .base_url
+            .clone()
+            .unwrap_or_else(|| OPENAI_BASE_URL.to_string());
+        return Ok(Arc::new(openai::OpenAIDriver::new(api_key, base_url)));
+    }
+
+    // Claude Code CLI — subprocess-based, no API key needed
+    if provider == "claude-code" {
+        let cli_path = config.base_url.clone();
+        return Ok(Arc::new(claude_code::ClaudeCodeDriver::new(cli_path)));
+    }
+
     // GitHub Copilot — wraps OpenAI-compatible driver with automatic token exchange.
     // The CopilotDriver exchanges the GitHub PAT for a Copilot API token on demand,
     // caches it, and refreshes when expired.
@@ -282,8 +344,8 @@ pub fn create_driver(config: &DriverConfig) -> Result<Arc<dyn LlmDriver>, LlmErr
         message: format!(
             "Unknown provider '{}'. Supported: anthropic, gemini, openai, groq, openrouter, \
              deepseek, together, mistral, fireworks, ollama, vllm, lmstudio, perplexity, \
-             cohere, ai21, cerebras, sambanova, huggingface, xai, replicate, github-copilot. \
-             Or set base_url for a custom OpenAI-compatible endpoint.",
+             cohere, ai21, cerebras, sambanova, huggingface, xai, replicate, github-copilot, \
+             codex, claude-code. Or set base_url for a custom OpenAI-compatible endpoint.",
             provider
         ),
     })
@@ -317,7 +379,11 @@ pub fn known_providers() -> &'static [&'static str] {
         "qwen",
         "minimax",
         "zhipu",
+        "zhipu_coding",
         "qianfan",
+        "volcengine",
+        "codex",
+        "claude-code",
     ]
 }
 
@@ -409,8 +475,12 @@ mod tests {
         assert!(providers.contains(&"qwen"));
         assert!(providers.contains(&"minimax"));
         assert!(providers.contains(&"zhipu"));
+        assert!(providers.contains(&"zhipu_coding"));
         assert!(providers.contains(&"qianfan"));
-        assert_eq!(providers.len(), 26);
+        assert!(providers.contains(&"volcengine"));
+        assert!(providers.contains(&"codex"));
+        assert!(providers.contains(&"claude-code"));
+        assert_eq!(providers.len(), 30);
     }
 
     #[test]

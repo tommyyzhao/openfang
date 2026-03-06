@@ -51,6 +51,23 @@ const MAX_CONTINUATIONS: u32 = 5;
 /// Maximum message history size before auto-trimming to prevent context overflow.
 const MAX_HISTORY_MESSAGES: usize = 20;
 
+/// Strip a provider prefix from a model ID before sending to the API.
+///
+/// Many models are stored as `provider/org/model` (e.g. `openrouter/google/gemini-2.5-flash`)
+/// but the upstream API expects just `org/model`. This also handles special routers
+/// like `openrouter/auto` → `auto`.
+pub fn strip_provider_prefix(model: &str, provider: &str) -> String {
+    let slash_prefix = format!("{}/", provider);
+    let colon_prefix = format!("{}:", provider);
+    if model.starts_with(&slash_prefix) {
+        model[slash_prefix.len()..].to_string()
+    } else if model.starts_with(&colon_prefix) {
+        model[colon_prefix.len()..].to_string()
+    } else {
+        model.to_string()
+    }
+}
+
 /// Default context window size (tokens) for token-based trimming.
 const DEFAULT_CONTEXT_WINDOW: usize = 200_000;
 
@@ -215,6 +232,19 @@ pub async fn run_agent_loop(
 
     // Validate and repair session history (drop orphans, merge consecutive)
     let mut messages = crate::session_repair::validate_and_repair(&llm_messages);
+
+    // Inject canonical context as the first user message (not in system prompt)
+    // to keep the system prompt stable across turns for provider prompt caching.
+    if let Some(cc_msg) = manifest
+        .metadata
+        .get("canonical_context_msg")
+        .and_then(|v| v.as_str())
+    {
+        if !cc_msg.is_empty() {
+            messages.insert(0, Message::user(cc_msg));
+        }
+    }
+
     let mut total_usage = TokenUsage::default();
     let final_response;
 
@@ -253,6 +283,7 @@ pub async fn run_agent_loop(
     // Build context budget from model's actual context window (or fallback to default)
     let ctx_window = context_window_tokens.unwrap_or(DEFAULT_CONTEXT_WINDOW);
     let context_budget = ContextBudget::new(ctx_window);
+    let mut any_tools_executed = false;
 
     for iteration in 0..max_iterations {
         debug!(iteration, "Agent loop iteration");
@@ -264,11 +295,20 @@ pub async fn run_agent_loop(
             warn!("Context overflow unrecoverable — suggest /reset or /compact");
         }
 
+        // Re-validate tool_call/tool_result pairing after overflow drains
+        // which may have broken assistant→tool ordering invariants.
+        if recovery != RecoveryStage::None {
+            messages = crate::session_repair::validate_and_repair(&messages);
+        }
+
         // Context guard: compact oversized tool results before LLM call
         apply_context_guard(&mut messages, &context_budget, available_tools);
 
+        // Strip provider prefix: "openrouter/google/gemini-2.5-flash" → "google/gemini-2.5-flash"
+        let api_model = strip_provider_prefix(&manifest.model.model, &manifest.model.provider);
+
         let request = CompletionRequest {
-            model: manifest.model.model.clone(),
+            model: api_model,
             messages: messages.clone(),
             tools: available_tools.to_vec(),
             max_tokens: manifest.model.max_tokens,
@@ -370,7 +410,7 @@ pub async fn run_agent_loop(
                         messages_count = messages.len(),
                         "Empty response from LLM — guard activated"
                     );
-                    if iteration > 0 {
+                    if any_tools_executed {
                         "[Task completed — the agent executed tools but did not produce a text summary.]".to_string()
                     } else {
                         "[The model returned an empty response. This usually means the model is overloaded, the context is too large, or the API key lacks credits. Try again or check /status.]".to_string()
@@ -471,6 +511,7 @@ pub async fn run_agent_loop(
             StopReason::ToolUse => {
                 // Reset MaxTokens continuation counter on tool use
                 consecutive_max_tokens = 0;
+                any_tools_executed = true;
 
                 // Execute tool calls
                 let assistant_blocks = response.content.clone();
@@ -521,6 +562,7 @@ pub async fn run_agent_loop(
                             warn!(tool = %tool_call.name, "Tool call blocked by loop guard");
                             tool_result_blocks.push(ContentBlock::ToolResult {
                                 tool_use_id: tool_call.id.clone(),
+                                tool_name: tool_call.name.clone(),
                                 content: msg.clone(),
                                 is_error: true,
                             });
@@ -558,6 +600,7 @@ pub async fn run_agent_loop(
                         if let Err(reason) = hook_reg.fire(&ctx) {
                             tool_result_blocks.push(ContentBlock::ToolResult {
                                 tool_use_id: tool_call.id.clone(),
+                                tool_name: tool_call.name.clone(),
                                 content: format!(
                                     "Hook blocked tool '{}': {}",
                                     tool_call.name, reason
@@ -641,8 +684,25 @@ pub async fn run_agent_loop(
 
                     tool_result_blocks.push(ContentBlock::ToolResult {
                         tool_use_id: result.tool_use_id,
+                        tool_name: tool_call.name.clone(),
                         content: final_content,
                         is_error: result.is_error,
+                    });
+                }
+
+                // Detect approval denials and inject guidance to prevent infinite retry loops
+                let denial_count = tool_result_blocks.iter().filter(|b| {
+                    matches!(b, ContentBlock::ToolResult { content, is_error: true, .. }
+                        if content.contains("requires human approval and was denied"))
+                }).count();
+                if denial_count > 0 {
+                    tool_result_blocks.push(ContentBlock::Text {
+                        text: format!(
+                            "[System: {} tool call(s) were denied by approval policy. \
+                             Do NOT retry denied tools. Explain to the user what you \
+                             wanted to do and that it requires their approval.]",
+                            denial_count
+                        ),
                     });
                 }
 
@@ -1075,6 +1135,19 @@ pub async fn run_agent_loop_streaming(
 
     // Validate and repair session history (drop orphans, merge consecutive)
     let mut messages = crate::session_repair::validate_and_repair(&llm_messages);
+
+    // Inject canonical context as the first user message (not in system prompt)
+    // to keep the system prompt stable across turns for provider prompt caching.
+    if let Some(cc_msg) = manifest
+        .metadata
+        .get("canonical_context_msg")
+        .and_then(|v| v.as_str())
+    {
+        if !cc_msg.is_empty() {
+            messages.insert(0, Message::user(cc_msg));
+        }
+    }
+
     let mut total_usage = TokenUsage::default();
     let final_response;
 
@@ -1111,6 +1184,7 @@ pub async fn run_agent_loop_streaming(
     // Build context budget from model's actual context window (or fallback to default)
     let ctx_window = context_window_tokens.unwrap_or(DEFAULT_CONTEXT_WINDOW);
     let context_budget = ContextBudget::new(ctx_window);
+    let mut any_tools_executed = false;
 
     for iteration in 0..max_iterations {
         debug!(iteration, "Streaming agent loop iteration");
@@ -1141,8 +1215,11 @@ pub async fn run_agent_loop_streaming(
         // Context guard: compact oversized tool results before LLM call
         apply_context_guard(&mut messages, &context_budget, available_tools);
 
+        // Strip provider prefix: "openrouter/google/gemini-2.5-flash" → "google/gemini-2.5-flash"
+        let api_model = strip_provider_prefix(&manifest.model.model, &manifest.model.provider);
+
         let request = CompletionRequest {
-            model: manifest.model.model.clone(),
+            model: api_model,
             messages: messages.clone(),
             tools: available_tools.to_vec(),
             max_tokens: manifest.model.max_tokens,
@@ -1247,7 +1324,7 @@ pub async fn run_agent_loop_streaming(
                         messages_count = messages.len(),
                         "Empty response from LLM (streaming) — guard activated"
                     );
-                    if iteration > 0 {
+                    if any_tools_executed {
                         "[Task completed — the agent executed tools but did not produce a text summary.]".to_string()
                     } else {
                         "[The model returned an empty response. This usually means the model is overloaded, the context is too large, or the API key lacks credits. Try again or check /status.]".to_string()
@@ -1347,6 +1424,7 @@ pub async fn run_agent_loop_streaming(
             StopReason::ToolUse => {
                 // Reset MaxTokens continuation counter on tool use
                 consecutive_max_tokens = 0;
+                any_tools_executed = true;
 
                 let assistant_blocks = response.content.clone();
 
@@ -1393,6 +1471,7 @@ pub async fn run_agent_loop_streaming(
                             warn!(tool = %tool_call.name, "Tool call blocked by loop guard (streaming)");
                             tool_result_blocks.push(ContentBlock::ToolResult {
                                 tool_use_id: tool_call.id.clone(),
+                                tool_name: tool_call.name.clone(),
                                 content: msg.clone(),
                                 is_error: true,
                             });
@@ -1430,6 +1509,7 @@ pub async fn run_agent_loop_streaming(
                         if let Err(reason) = hook_reg.fire(&ctx) {
                             tool_result_blocks.push(ContentBlock::ToolResult {
                                 tool_use_id: tool_call.id.clone(),
+                                tool_name: tool_call.name.clone(),
                                 content: format!(
                                     "Hook blocked tool '{}': {}",
                                     tool_call.name, reason
@@ -1527,8 +1607,25 @@ pub async fn run_agent_loop_streaming(
 
                     tool_result_blocks.push(ContentBlock::ToolResult {
                         tool_use_id: result.tool_use_id,
+                        tool_name: tool_call.name.clone(),
                         content: final_content,
                         is_error: result.is_error,
+                    });
+                }
+
+                // Detect approval denials and inject guidance to prevent infinite retry loops
+                let denial_count = tool_result_blocks.iter().filter(|b| {
+                    matches!(b, ContentBlock::ToolResult { content, is_error: true, .. }
+                        if content.contains("requires human approval and was denied"))
+                }).count();
+                if denial_count > 0 {
+                    tool_result_blocks.push(ContentBlock::Text {
+                        text: format!(
+                            "[System: {} tool call(s) were denied by approval policy. \
+                             Do NOT retry denied tools. Explain to the user what you \
+                             wanted to do and that it requires their approval.]",
+                            denial_count
+                        ),
                     });
                 }
 
@@ -1736,6 +1833,136 @@ fn recover_text_tool_calls(text: &str, available_tools: &[ToolDefinition]) -> Ve
             name: tool_name.to_string(),
             input,
         });
+    }
+
+    // Pattern 3: <tool>TOOL_NAME{JSON}</tool>  (Qwen / DeepSeek variant)
+    search_from = 0;
+    while let Some(start) = text[search_from..].find("<tool>") {
+        let abs_start = search_from + start;
+        let after_tag = abs_start + "<tool>".len();
+
+        let Some(close_offset) = text[after_tag..].find("</tool>") else {
+            search_from = after_tag;
+            continue;
+        };
+        let inner = &text[after_tag..after_tag + close_offset];
+        search_from = after_tag + close_offset + "</tool>".len();
+
+        let Some(brace_pos) = inner.find('{') else {
+            continue;
+        };
+        let tool_name = inner[..brace_pos].trim();
+        let json_body = inner[brace_pos..].trim();
+
+        if tool_name.is_empty() || !tool_names.contains(&tool_name) {
+            continue;
+        }
+
+        let input: serde_json::Value = match serde_json::from_str(json_body) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        if calls
+            .iter()
+            .any(|c| c.name == tool_name && c.input == input)
+        {
+            continue;
+        }
+
+        info!(
+            tool = tool_name,
+            "Recovered text-based tool call (<tool> variant) → synthetic ToolUse"
+        );
+        calls.push(ToolCall {
+            id: format!("recovered_{}", uuid::Uuid::new_v4()),
+            name: tool_name.to_string(),
+            input,
+        });
+    }
+
+    // Pattern 4: Markdown code blocks containing tool_name {JSON}
+    // Matches: ```\nexec {"command":"ls"}\n``` or ```bash\nexec {"command":"ls"}\n```
+    {
+        let mut in_block = false;
+        let mut block_content = String::new();
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("```") {
+                if in_block {
+                    // End of block — try to extract tool call from content
+                    let content = block_content.trim();
+                    if let Some(brace_pos) = content.find('{') {
+                        let potential_tool = content[..brace_pos].trim();
+                        if tool_names.contains(&potential_tool) {
+                            if let Ok(input) = serde_json::from_str::<serde_json::Value>(
+                                content[brace_pos..].trim(),
+                            ) {
+                                if !calls
+                                    .iter()
+                                    .any(|c| c.name == potential_tool && c.input == input)
+                                {
+                                    info!(
+                                        tool = potential_tool,
+                                        "Recovered tool call from markdown code block"
+                                    );
+                                    calls.push(ToolCall {
+                                        id: format!("recovered_{}", uuid::Uuid::new_v4()),
+                                        name: potential_tool.to_string(),
+                                        input,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    block_content.clear();
+                    in_block = false;
+                } else {
+                    in_block = true;
+                    block_content.clear();
+                }
+            } else if in_block {
+                if !block_content.is_empty() {
+                    block_content.push('\n');
+                }
+                block_content.push_str(trimmed);
+            }
+        }
+    }
+
+    // Pattern 5: Backtick-wrapped tool call: `tool_name {"key":"value"}`
+    {
+        let parts: Vec<&str> = text.split('`').collect();
+        // Every odd-indexed element is inside backticks
+        for chunk in parts.iter().skip(1).step_by(2) {
+            let trimmed = chunk.trim();
+            if let Some(brace_pos) = trimmed.find('{') {
+                let potential_tool = trimmed[..brace_pos].trim();
+                if !potential_tool.is_empty()
+                    && !potential_tool.contains(' ')
+                    && tool_names.contains(&potential_tool)
+                {
+                    if let Ok(input) =
+                        serde_json::from_str::<serde_json::Value>(trimmed[brace_pos..].trim())
+                    {
+                        if !calls
+                            .iter()
+                            .any(|c| c.name == potential_tool && c.input == input)
+                        {
+                            info!(
+                                tool = potential_tool,
+                                "Recovered tool call from backtick-wrapped text"
+                            );
+                            calls.push(ToolCall {
+                                id: format!("recovered_{}", uuid::Uuid::new_v4()),
+                                name: potential_tool.to_string(),
+                                input,
+                            });
+                        }
+                    }
+                }
+            }
+        }
     }
 
     calls
@@ -2279,10 +2506,10 @@ mod tests {
         .await
         .expect("Loop should complete with fallback");
 
-        // After retry (iteration 1), should hit the iteration > 0 guard
+        // No tools were executed, so should get the empty response message
         assert!(
-            result.response.contains("Task completed"),
-            "Expected fallback after retry failure, got: {:?}",
+            result.response.contains("empty response"),
+            "Expected empty response fallback (no tools executed), got: {:?}",
             result.response
         );
     }
@@ -2593,6 +2820,86 @@ mod tests {
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].name, "web_search");
         assert_eq!(calls[1].name, "web_fetch");
+    }
+
+    #[test]
+    fn test_recover_tool_tag_variant() {
+        let tools = vec![ToolDefinition {
+            name: "exec".into(),
+            description: "Execute".into(),
+            input_schema: serde_json::json!({}),
+        }];
+        let text = r#"I'll run that for you. <tool>exec{"command":"ls -la"}</tool>"#;
+        let calls = recover_text_tool_calls(text, &tools);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "exec");
+        assert_eq!(calls[0].input["command"], "ls -la");
+    }
+
+    #[test]
+    fn test_recover_markdown_code_block() {
+        let tools = vec![ToolDefinition {
+            name: "exec".into(),
+            description: "Execute".into(),
+            input_schema: serde_json::json!({}),
+        }];
+        let text = "I'll execute that command:\n```\nexec {\"command\": \"ls -la\"}\n```";
+        let calls = recover_text_tool_calls(text, &tools);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "exec");
+        assert_eq!(calls[0].input["command"], "ls -la");
+    }
+
+    #[test]
+    fn test_recover_markdown_code_block_with_lang() {
+        let tools = vec![ToolDefinition {
+            name: "web_search".into(),
+            description: "Search".into(),
+            input_schema: serde_json::json!({}),
+        }];
+        let text = "```json\nweb_search {\"query\": \"rust\"}\n```";
+        let calls = recover_text_tool_calls(text, &tools);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "web_search");
+    }
+
+    #[test]
+    fn test_recover_backtick_wrapped() {
+        let tools = vec![ToolDefinition {
+            name: "exec".into(),
+            description: "Execute".into(),
+            input_schema: serde_json::json!({}),
+        }];
+        let text = r#"Let me run `exec {"command":"pwd"}` for you."#;
+        let calls = recover_text_tool_calls(text, &tools);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "exec");
+        assert_eq!(calls[0].input["command"], "pwd");
+    }
+
+    #[test]
+    fn test_recover_backtick_ignores_unknown_tool() {
+        let tools = vec![ToolDefinition {
+            name: "exec".into(),
+            description: "Execute".into(),
+            input_schema: serde_json::json!({}),
+        }];
+        let text = r#"Try `unknown_tool {"key":"val"}` instead."#;
+        let calls = recover_text_tool_calls(text, &tools);
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn test_recover_no_duplicates_across_patterns() {
+        let tools = vec![ToolDefinition {
+            name: "exec".into(),
+            description: "Execute".into(),
+            input_schema: serde_json::json!({}),
+        }];
+        // Same call in both function tag and tool tag — should only appear once
+        let text = r#"<function=exec>{"command":"ls"}</function> <tool>exec{"command":"ls"}</tool>"#;
+        let calls = recover_text_tool_calls(text, &tools);
+        assert_eq!(calls.len(), 1);
     }
 
     // --- End-to-end integration test: text-as-tool-call recovery through agent loop ---

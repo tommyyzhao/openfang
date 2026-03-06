@@ -281,8 +281,8 @@ pub struct BrowserConfig {
     pub idle_timeout_secs: u64,
     /// Maximum concurrent browser sessions.
     pub max_sessions: usize,
-    /// Python executable path (e.g., "python3" on Unix, "python" on Windows).
-    pub python_path: String,
+    /// Path to Chromium/Chrome binary. Auto-detected if None.
+    pub chromium_path: Option<String>,
 }
 
 impl Default for BrowserConfig {
@@ -294,11 +294,7 @@ impl Default for BrowserConfig {
             timeout_secs: 30,
             idle_timeout_secs: 300,
             max_sessions: 5,
-            python_path: if cfg!(windows) {
-                "python".to_string()
-            } else {
-                "python3".to_string()
-            },
+            chromium_path: None,
         }
     }
 }
@@ -750,11 +746,14 @@ impl Default for CanvasConfig {
 #[serde(rename_all = "lowercase")]
 pub enum ExecSecurityMode {
     /// Block all shell execution.
+    #[serde(alias = "none", alias = "disabled")]
     Deny,
     /// Only allow commands in safe_bins or allowed_commands.
     #[default]
+    #[serde(alias = "restricted")]
     Allowlist,
     /// Allow all commands (unsafe, dev only).
+    #[serde(alias = "allow", alias = "all", alias = "unrestricted")]
     Full,
 }
 
@@ -996,7 +995,7 @@ pub struct KernelConfig {
     #[serde(default)]
     pub webhook_triggers: Option<WebhookTriggerConfig>,
     /// Execution approval policy.
-    #[serde(default)]
+    #[serde(default, alias = "approval_policy")]
     pub approval: crate::approval::ApprovalPolicy,
     /// Cron scheduler max total jobs across all agents. Default: 500.
     #[serde(default = "default_max_cron_jobs")]
@@ -1047,6 +1046,30 @@ pub struct KernelConfig {
     /// Paths are expanded at boot. Set via `--project` CLI flag or `project_dirs` in config.toml.
     #[serde(default)]
     pub project_dirs: Vec<PathBuf>,
+    /// OAuth client ID overrides for PKCE flows.
+    #[serde(default)]
+    pub oauth: OAuthConfig,
+}
+
+/// OAuth client ID overrides for PKCE flows.
+///
+/// Configure in config.toml:
+/// ```toml
+/// [oauth]
+/// google_client_id = "your-google-client-id"
+/// github_client_id = "your-github-client-id"
+/// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OAuthConfig {
+    /// Google OAuth2 client ID for PKCE flow.
+    pub google_client_id: Option<String>,
+    /// GitHub OAuth client ID for PKCE flow.
+    pub github_client_id: Option<String>,
+    /// Microsoft (Entra ID) OAuth client ID.
+    pub microsoft_client_id: Option<String>,
+    /// Slack OAuth client ID.
+    pub slack_client_id: Option<String>,
 }
 
 /// Global spending budget configuration.
@@ -1149,7 +1172,7 @@ fn default_language() -> String {
 
 impl Default for KernelConfig {
     fn default() -> Self {
-        let home_dir = dirs_next_home().join(".openfang");
+        let home_dir = openfang_home_dir();
         Self {
             data_dir: home_dir.join("data"),
             home_dir,
@@ -1193,6 +1216,7 @@ impl Default for KernelConfig {
             budget: BudgetConfig::default(),
             provider_urls: HashMap::new(),
             project_dirs: Vec::new(),
+            oauth: OAuthConfig::default(),
         }
     }
 }
@@ -1293,9 +1317,16 @@ impl std::fmt::Debug for KernelConfig {
     }
 }
 
-/// Fallback home directory resolution.
-fn dirs_next_home() -> PathBuf {
-    dirs::home_dir().unwrap_or_else(std::env::temp_dir)
+/// Resolve the OpenFang home directory.
+///
+/// Priority: `OPENFANG_HOME` env var > `~/.openfang`.
+fn openfang_home_dir() -> PathBuf {
+    if let Ok(home) = std::env::var("OPENFANG_HOME") {
+        return PathBuf::from(home);
+    }
+    dirs::home_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join(".openfang")
 }
 
 /// Default LLM model configuration.
@@ -1537,10 +1568,14 @@ pub struct DiscordConfig {
     /// Env var name holding the bot token (NOT the token itself).
     pub bot_token_env: String,
     /// Guild (server) IDs allowed to interact (empty = allow all).
-    pub allowed_guilds: Vec<u64>,
+    /// Accepts strings for consistency with other channel configs.
+    pub allowed_guilds: Vec<String>,
+    /// User IDs allowed to interact (empty = allow all).
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
     /// Default agent name to route messages to.
     pub default_agent: Option<String>,
-    /// Gateway intents bitmask (default: 33280 = GUILD_MESSAGES | MESSAGE_CONTENT).
+    /// Gateway intents bitmask (default: 37376 = GUILD_MESSAGES | DIRECT_MESSAGES | MESSAGE_CONTENT).
     pub intents: u64,
     /// Per-channel behavior overrides.
     #[serde(default)]
@@ -1552,8 +1587,9 @@ impl Default for DiscordConfig {
         Self {
             bot_token_env: "DISCORD_BOT_TOKEN".to_string(),
             allowed_guilds: vec![],
+            allowed_users: vec![],
             default_agent: None,
-            intents: 33280,
+            intents: 37376,
             overrides: ChannelOverrides::default(),
         }
     }
@@ -3210,7 +3246,7 @@ mod tests {
         let dc = DiscordConfig::default();
         assert_eq!(dc.bot_token_env, "DISCORD_BOT_TOKEN");
         assert!(dc.allowed_guilds.is_empty());
-        assert_eq!(dc.intents, 33280);
+        assert_eq!(dc.intents, 37376);
     }
 
     #[test]

@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 
 /// A discovered agent template.
+#[allow(dead_code)]
 pub struct AgentTemplate {
     /// Template name (directory name).
     pub name: String,
@@ -40,9 +41,16 @@ pub fn discover_template_dirs() -> Vec<PathBuf> {
         }
     }
 
-    // Installed templates
-    if let Some(home) = dirs::home_dir() {
-        let agents = home.join(".openfang").join("agents");
+    // Installed templates (respects OPENFANG_HOME)
+    let of_home = if let Ok(h) = std::env::var("OPENFANG_HOME") {
+        PathBuf::from(h)
+    } else if let Some(home) = dirs::home_dir() {
+        home.join(".openfang")
+    } else {
+        std::env::temp_dir().join(".openfang")
+    };
+    {
+        let agents = of_home.join("agents");
         if agents.is_dir() && !dirs.contains(&agents) {
             dirs.push(agents);
         }
@@ -129,6 +137,7 @@ fn extract_description(toml_str: &str) -> String {
 /// Load agent templates from project directories' `.openfang/agents/` folders.
 /// Project templates are namespaced with `project:{dir_name}:` prefix.
 /// Existing names in `seen` are skipped to avoid duplicates.
+#[allow(dead_code)]
 pub fn load_project_templates(
     project_dirs: &[std::path::PathBuf],
     seen: &mut std::collections::HashSet<String>,

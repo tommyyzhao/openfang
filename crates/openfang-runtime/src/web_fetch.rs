@@ -32,23 +32,62 @@ impl WebFetchEngine {
         }
     }
 
-    /// Fetch a URL with full security pipeline.
+    /// Fetch a URL with full security pipeline (GET only, for backwards compat).
     pub async fn fetch(&self, url: &str) -> Result<String, String> {
+        self.fetch_with_options(url, "GET", None, None).await
+    }
+
+    /// Fetch a URL with configurable HTTP method, headers, and body.
+    pub async fn fetch_with_options(
+        &self,
+        url: &str,
+        method: &str,
+        headers: Option<&serde_json::Map<String, serde_json::Value>>,
+        body: Option<&str>,
+    ) -> Result<String, String> {
+        let method_upper = method.to_uppercase();
+
         // Step 1: SSRF protection — BEFORE any network I/O
         check_ssrf(url)?;
 
-        // Step 2: Cache lookup
-        let cache_key = format!("fetch:{}", url);
-        if let Some(cached) = self.cache.get(&cache_key) {
-            debug!(url, "Fetch cache hit");
-            return Ok(cached);
+        // Step 2: Cache lookup (only for GET)
+        let cache_key = format!("fetch:{}:{}", method_upper, url);
+        if method_upper == "GET" {
+            if let Some(cached) = self.cache.get(&cache_key) {
+                debug!(url, "Fetch cache hit");
+                return Ok(cached);
+            }
         }
 
-        // Step 3: HTTP GET
-        let resp = self
-            .client
-            .get(url)
-            .header("User-Agent", "Mozilla/5.0 (compatible; OpenFangAgent/0.1)")
+        // Step 3: Build request with configured method
+        let mut req = match method_upper.as_str() {
+            "POST" => self.client.post(url),
+            "PUT" => self.client.put(url),
+            "PATCH" => self.client.patch(url),
+            "DELETE" => self.client.delete(url),
+            _ => self.client.get(url),
+        };
+        req = req.header("User-Agent", "Mozilla/5.0 (compatible; OpenFangAgent/0.1)");
+
+        // Add custom headers
+        if let Some(hdrs) = headers {
+            for (k, v) in hdrs {
+                if let Some(val) = v.as_str() {
+                    req = req.header(k.as_str(), val);
+                }
+            }
+        }
+
+        // Add body for non-GET methods
+        if let Some(b) = body {
+            // Auto-detect JSON body
+            if b.trim_start().starts_with('{') || b.trim_start().starts_with('[') {
+                req = req.header("Content-Type", "application/json");
+            }
+            req = req.body(b.to_string());
+        }
+
+        let resp = req
             .send()
             .await
             .map_err(|e| format!("HTTP request failed: {e}"))?;
@@ -72,22 +111,25 @@ impl WebFetchEngine {
             .unwrap_or("")
             .to_string();
 
-        let body = resp
+        let resp_body = resp
             .text()
             .await
             .map_err(|e| format!("Failed to read response body: {e}"))?;
 
-        // Step 4: Detect HTML and optionally convert to Markdown
-        let processed = if self.config.readability && is_html(&content_type, &body) {
-            let markdown = html_to_markdown(&body);
+        // Step 4: For GET requests, detect HTML and convert to Markdown.
+        // For non-GET (API calls), return raw body — don't mangle JSON/XML responses.
+        let processed = if method_upper == "GET"
+            && self.config.readability
+            && is_html(&content_type, &resp_body)
+        {
+            let markdown = html_to_markdown(&resp_body);
             if markdown.trim().is_empty() {
-                // Fallback to raw text if extraction produced nothing
-                body
+                resp_body
             } else {
                 markdown
             }
         } else {
-            body
+            resp_body
         };
 
         // Step 5: Truncate
@@ -107,8 +149,10 @@ impl WebFetchEngine {
             wrap_external_content(url, &truncated)
         );
 
-        // Step 7: Cache
-        self.cache.put(cache_key, result.clone());
+        // Step 7: Cache (only GET responses)
+        if method_upper == "GET" {
+            self.cache.put(cache_key, result.clone());
+        }
 
         Ok(result)
     }
@@ -140,15 +184,28 @@ pub(crate) fn check_ssrf(url: &str) -> Result<(), String> {
     }
 
     let host = extract_host(url);
-    let hostname = host.split(':').next().unwrap_or(&host);
+    // For IPv6 bracket notation like [::1]:80, extract [::1] as hostname
+    let hostname = if host.starts_with('[') {
+        host.find(']')
+            .map(|i| &host[..=i])
+            .unwrap_or(&host)
+    } else {
+        host.split(':').next().unwrap_or(&host)
+    };
 
     // Hostname-based blocklist (catches metadata endpoints)
     let blocked = [
         "localhost",
+        "ip6-localhost",
         "metadata.google.internal",
         "metadata.aws.internal",
         "instance-data",
         "169.254.169.254",
+        "100.100.100.200", // Alibaba Cloud IMDS
+        "192.0.0.192",     // Azure IMDS alternative
+        "0.0.0.0",
+        "::1",
+        "[::1]",
     ];
     if blocked.contains(&hostname) {
         return Err(format!("SSRF blocked: {hostname} is a restricted hostname"));
@@ -192,6 +249,19 @@ fn is_private_ip(ip: &IpAddr) -> bool {
 fn extract_host(url: &str) -> String {
     if let Some(after_scheme) = url.split("://").nth(1) {
         let host_port = after_scheme.split('/').next().unwrap_or(after_scheme);
+        // Handle IPv6 bracket notation: [::1]:8080
+        if host_port.starts_with('[') {
+            // Extract [addr]:port or [addr]
+            if let Some(bracket_end) = host_port.find(']') {
+                let ipv6_host = &host_port[..=bracket_end]; // includes brackets
+                let after_bracket = &host_port[bracket_end + 1..];
+                if let Some(port) = after_bracket.strip_prefix(':') {
+                    return format!("{ipv6_host}:{port}");
+                }
+                let default_port = if url.starts_with("https") { 443 } else { 80 };
+                return format!("{ipv6_host}:{default_port}");
+            }
+        }
         if host_port.contains(':') {
             host_port.to_string()
         } else if url.starts_with("https") {
@@ -244,5 +314,36 @@ mod tests {
         assert!(check_ssrf("file:///etc/passwd").is_err());
         assert!(check_ssrf("ftp://internal.corp/data").is_err());
         assert!(check_ssrf("gopher://evil.com").is_err());
+    }
+
+    #[test]
+    fn test_ssrf_blocks_cloud_metadata() {
+        // Alibaba Cloud IMDS
+        assert!(check_ssrf("http://100.100.100.200/latest/meta-data/").is_err());
+        // Azure IMDS alternative
+        assert!(check_ssrf("http://192.0.0.192/metadata/instance").is_err());
+    }
+
+    #[test]
+    fn test_ssrf_blocks_zero_ip() {
+        assert!(check_ssrf("http://0.0.0.0/").is_err());
+    }
+
+    #[test]
+    fn test_ssrf_blocks_ipv6_localhost() {
+        assert!(check_ssrf("http://[::1]/admin").is_err());
+        assert!(check_ssrf("http://[::1]:8080/api").is_err());
+    }
+
+    #[test]
+    fn test_extract_host_ipv6() {
+        let h = extract_host("http://[::1]:8080/path");
+        assert_eq!(h, "[::1]:8080");
+
+        let h2 = extract_host("https://[::1]/path");
+        assert_eq!(h2, "[::1]:443");
+
+        let h3 = extract_host("http://[::1]/path");
+        assert_eq!(h3, "[::1]:80");
     }
 }
