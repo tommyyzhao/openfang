@@ -179,6 +179,7 @@ impl SetupWizard {
             profile: None,
             fallback_models: vec![],
             exec_policy: None,
+            project_template_dir: None,
         };
 
         let skills_to_install: Vec<String> = intent

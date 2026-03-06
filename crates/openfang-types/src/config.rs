@@ -1043,6 +1043,10 @@ pub struct KernelConfig {
     /// e.g. `ollama = "http://192.168.1.100:11434/v1"`
     #[serde(default)]
     pub provider_urls: HashMap<String, String>,
+    /// Project directories containing `.openfang/` for project-local hands and agent templates.
+    /// Paths are expanded at boot. Set via `--project` CLI flag or `project_dirs` in config.toml.
+    #[serde(default)]
+    pub project_dirs: Vec<PathBuf>,
 }
 
 /// Global spending budget configuration.
@@ -1188,6 +1192,7 @@ impl Default for KernelConfig {
             thinking: None,
             budget: BudgetConfig::default(),
             provider_urls: HashMap::new(),
+            project_dirs: Vec::new(),
         }
     }
 }
@@ -1280,6 +1285,10 @@ impl std::fmt::Debug for KernelConfig {
                 &format!("{} provider(s)", self.auth_profiles.len()),
             )
             .field("thinking", &self.thinking.is_some())
+            .field(
+                "project_dirs",
+                &format!("{} dir(s)", self.project_dirs.len()),
+            )
             .finish()
     }
 }

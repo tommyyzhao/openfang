@@ -10,6 +10,11 @@ pub struct AgentTemplate {
     pub description: String,
     /// Raw TOML content.
     pub content: String,
+    /// Source of this template (e.g. "bundled", "project:/path/to/repo").
+    pub source: String,
+    /// If from a project, the path to the project's `.openfang/agents/{name}/` directory.
+    /// Used to copy seed files (SOUL.md, TOOLS.md, skills/) into the workspace.
+    pub project_template_dir: Option<std::path::PathBuf>,
 }
 
 /// Discover template directories. Checks:
@@ -81,6 +86,8 @@ pub fn load_all_templates() -> Vec<AgentTemplate> {
                         name,
                         description,
                         content,
+                        source: "filesystem".to_string(),
+                        project_template_dir: None,
                     });
                 }
             }
@@ -95,6 +102,8 @@ pub fn load_all_templates() -> Vec<AgentTemplate> {
                 name: name.to_string(),
                 description,
                 content: content.to_string(),
+                source: "bundled".to_string(),
+                project_template_dir: None,
             });
         }
     }
@@ -115,6 +124,62 @@ fn extract_description(toml_str: &str) -> String {
         }
     }
     String::new()
+}
+
+/// Load agent templates from project directories' `.openfang/agents/` folders.
+/// Project templates are namespaced with `project:{dir_name}:` prefix.
+/// Existing names in `seen` are skipped to avoid duplicates.
+pub fn load_project_templates(
+    project_dirs: &[std::path::PathBuf],
+    seen: &mut std::collections::HashSet<String>,
+) -> Vec<AgentTemplate> {
+    let mut templates = Vec::new();
+    for project_dir in project_dirs {
+        let agents_dir = project_dir.join(".openfang").join("agents");
+        if !agents_dir.is_dir() {
+            continue;
+        }
+        let dir_name = project_dir
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+
+        let entries = match std::fs::read_dir(&agents_dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            // SECURITY: skip symlinks
+            if path.read_link().is_ok() {
+                continue;
+            }
+            let manifest = path.join("agent.toml");
+            if !manifest.exists() {
+                continue;
+            }
+            let base_name = entry.file_name().to_string_lossy().to_string();
+            let namespaced = format!("project:{dir_name}:{base_name}");
+            if !seen.insert(namespaced.clone()) {
+                continue;
+            }
+            if let Ok(content) = std::fs::read_to_string(&manifest) {
+                let description = extract_description(&content);
+                templates.push(AgentTemplate {
+                    name: namespaced,
+                    description,
+                    content,
+                    source: format!("project:{}", project_dir.display()),
+                    project_template_dir: Some(path),
+                });
+            }
+        }
+    }
+    templates
 }
 
 /// Format a template description as a hint for cliclack select items.

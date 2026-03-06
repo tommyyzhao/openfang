@@ -295,6 +295,7 @@ mod tests {
                 workspace: None,
                 generate_identity_files: true,
                 exec_policy: None,
+                project_template_dir: None,
             },
             state: AgentState::Created,
             mode: AgentMode::default(),

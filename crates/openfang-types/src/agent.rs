@@ -476,6 +476,10 @@ pub struct AgentManifest {
     /// Per-agent exec policy override. If None, uses global exec_policy.
     #[serde(default)]
     pub exec_policy: Option<crate::config::ExecPolicy>,
+    /// Project template directory for seed files (SOUL.md, TOOLS.md, skills/).
+    /// Set when spawning from a project-local template. Runtime-only, not serialized.
+    #[serde(skip)]
+    pub project_template_dir: Option<PathBuf>,
 }
 
 fn default_true() -> bool {
@@ -508,6 +512,7 @@ impl Default for AgentManifest {
             workspace: None,
             generate_identity_files: true,
             exec_policy: None,
+            project_template_dir: None,
         }
     }
 }
@@ -763,6 +768,7 @@ mod tests {
             workspace: None,
             generate_identity_files: true,
             exec_policy: None,
+            project_template_dir: None,
         };
         let json = serde_json::to_string(&manifest).unwrap();
         let deserialized: AgentManifest = serde_json::from_str(&json).unwrap();
