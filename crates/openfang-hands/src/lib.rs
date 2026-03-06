@@ -11,7 +11,18 @@ use chrono::{DateTime, Utc};
 use openfang_types::agent::AgentId;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use uuid::Uuid;
+
+/// Where a hand definition was loaded from.
+#[derive(Debug, Clone, Default)]
+pub enum HandSource {
+    /// Compile-time bundled hand.
+    #[default]
+    Bundled,
+    /// Loaded from a project's `.openfang/hands/` directory.
+    Project { dir: PathBuf },
+}
 
 // ─── Error types ─────────────────────────────────────────────────────────────
 
@@ -334,6 +345,9 @@ pub struct HandDefinition {
     /// Bundled skill content (populated at load time, not in TOML).
     #[serde(skip)]
     pub skill_content: Option<String>,
+    /// Where this hand was loaded from (bundled vs project-local).
+    #[serde(skip)]
+    pub source: HandSource,
 }
 
 /// Runtime status of a Hand instance.

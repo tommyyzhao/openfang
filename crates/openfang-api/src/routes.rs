@@ -3369,6 +3369,10 @@ pub async fn list_hands(State(state): State<Arc<AppState>>) -> impl IntoResponse
                 "category": d.category,
                 "icon": d.icon,
                 "tools": d.tools,
+                "source": match &d.source {
+                    openfang_hands::HandSource::Bundled => "bundled".to_string(),
+                    openfang_hands::HandSource::Project { dir } => format!("project:{}", dir.display()),
+                },
                 "requirements_met": all_satisfied,
                 "requirements": reqs.iter().map(|(r, ok)| serde_json::json!({
                     "key": r.key,

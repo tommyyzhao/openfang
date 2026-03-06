@@ -476,6 +476,10 @@ pub struct AgentManifest {
     /// Per-agent exec policy override. If None, uses global exec_policy.
     #[serde(default)]
     pub exec_policy: Option<crate::config::ExecPolicy>,
+    /// Project template directory for seed files (SOUL.md, TOOLS.md, skills/).
+    /// Set when spawning from a project-local template. Runtime-only, not serialized.
+    #[serde(skip)]
+    pub project_template_dir: Option<PathBuf>,
     /// Tool allowlist — only these tools are available (empty = all tools).
     #[serde(default, deserialize_with = "crate::serde_compat::vec_lenient")]
     pub tool_allowlist: Vec<String>,
@@ -514,6 +518,7 @@ impl Default for AgentManifest {
             workspace: None,
             generate_identity_files: true,
             exec_policy: None,
+            project_template_dir: None,
             tool_allowlist: Vec::new(),
             tool_blocklist: Vec::new(),
         }
@@ -771,6 +776,7 @@ mod tests {
             workspace: None,
             generate_identity_files: true,
             exec_policy: None,
+            project_template_dir: None,
             tool_allowlist: Vec::new(),
             tool_blocklist: Vec::new(),
         };

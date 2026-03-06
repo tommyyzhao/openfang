@@ -419,6 +419,52 @@ fn generate_identity_files(workspace: &Path, manifest: &AgentManifest) {
     }
 }
 
+/// Copy seed files from a project template directory into an agent workspace.
+/// Copies SOUL.md, TOOLS.md, and skills/*.md — overwrites generated defaults.
+/// USER.md and MEMORY.md are NOT copied (they are user-specific runtime state).
+fn copy_project_seed_files(template_dir: &Path, workspace: &Path) {
+    // Copy identity seed files (SOUL.md, TOOLS.md)
+    for filename in &["SOUL.md", "TOOLS.md"] {
+        let src = template_dir.join(filename);
+        if src.is_file() {
+            let dst = workspace.join(filename);
+            if let Err(e) = std::fs::copy(&src, &dst) {
+                tracing::warn!(
+                    src = %src.display(),
+                    dst = %dst.display(),
+                    error = %e,
+                    "Failed to copy project seed file"
+                );
+            } else {
+                tracing::debug!(file = %filename, "Copied project seed file to workspace");
+            }
+        }
+    }
+
+    // Copy skills directory
+    let src_skills = template_dir.join("skills");
+    if src_skills.is_dir() {
+        let dst_skills = workspace.join("skills");
+        if let Ok(entries) = std::fs::read_dir(&src_skills) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() {
+                    if let Some(name) = path.file_name() {
+                        let dst = dst_skills.join(name);
+                        if let Err(e) = std::fs::copy(&path, &dst) {
+                            tracing::warn!(
+                                src = %path.display(),
+                                error = %e,
+                                "Failed to copy project skill file"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Append an assistant response summary to the daily memory log (best-effort, append-only).
 /// Caps daily log at 1MB to prevent unbounded growth.
 fn append_daily_memory_log(workspace: &Path, response: &str) {
@@ -692,6 +738,46 @@ impl OpenFangKernel {
         let hand_count = hand_registry.load_bundled();
         if hand_count > 0 {
             info!("Loaded {hand_count} bundled hand(s)");
+        }
+
+        // Load project-local hands from configured project directories
+        for project_dir in &config.project_dirs {
+            let openfang_dir = project_dir.join(".openfang");
+            if !openfang_dir.is_dir() {
+                warn!(
+                    path = %project_dir.display(),
+                    "Project directory has no .openfang/ — skipped"
+                );
+                continue;
+            }
+            // Warn about missing .gitignore (runtime state could leak into git)
+            if !openfang_dir.join(".gitignore").exists() {
+                warn!(
+                    path = %project_dir.display(),
+                    "Project .openfang/ has no .gitignore — runtime state may leak into git"
+                );
+            }
+            let project_hand_count = hand_registry.load_from_directory(project_dir);
+            if project_hand_count > 0 {
+                info!(
+                    path = %project_dir.display(),
+                    count = project_hand_count,
+                    "Loaded project-local hand(s)"
+                );
+            }
+        }
+
+        // CWD detection: if .openfang/ exists in CWD but is not in project_dirs, log a notice
+        if let Ok(cwd) = std::env::current_dir() {
+            if cwd.join(".openfang").is_dir()
+                && !config.project_dirs.iter().any(|d| d == &cwd)
+            {
+                info!(
+                    cwd = %cwd.display(),
+                    "Found .openfang/ in CWD but it is not in project_dirs — \
+                     use `openfang start --project .` to load project-local definitions"
+                );
+            }
         }
 
         // Initialize extension/integration registry
@@ -1198,6 +1284,12 @@ impl OpenFangKernel {
         if manifest.generate_identity_files {
             generate_identity_files(&workspace_dir, &manifest);
         }
+
+        // Copy seed files from project template directory (overrides generated defaults)
+        if let Some(ref template_dir) = manifest.project_template_dir {
+            copy_project_seed_files(template_dir, &workspace_dir);
+        }
+
         manifest.workspace = Some(workspace_dir);
 
         // Register capabilities
@@ -5465,6 +5557,7 @@ mod tests {
             workspace: None,
             generate_identity_files: true,
             exec_policy: None,
+            project_template_dir: None,
             tool_allowlist: vec![],
             tool_blocklist: vec![],
         };
@@ -5502,6 +5595,7 @@ mod tests {
             workspace: None,
             generate_identity_files: true,
             exec_policy: None,
+            project_template_dir: None,
             tool_allowlist: vec![],
             tool_blocklist: vec![],
         }

@@ -356,6 +356,7 @@ mod tests {
                 workspace: None,
                 generate_identity_files: true,
                 exec_policy: None,
+                project_template_dir: None,
                 tool_allowlist: vec![],
                 tool_blocklist: vec![],
             },
